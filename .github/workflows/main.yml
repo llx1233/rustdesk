@@ -1,0 +1,125 @@
+name: Build RustDesk Client
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  RENDEZVOUS_SERVER: "10.232.161.23"
+  RS_PUB_KEY: "6FeQAbmtgHVUqtUq86NlqOcVyWg4tcoQd6TxS81BtII="
+  APP_NAME: "CustomRustDesk"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+        targets: x86_64-pc-windows-msvc
+        
+    - name: Install dependencies
+      run: |
+        choco install wix --version 3.14 -y
+        choco install vcpkg -y
+        echo "VCPKG_ROOT=C:\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        echo "RUSTDESK_VCPKG=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        C:\vcpkg\vcpkg install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static
+        
+    - name: Configure custom parameters
+      run: |
+        # 修改配置文件
+        $configFile = "rustdesk\src\constants.rs"
+        $content = Get-Content -Path $configFile -Encoding UTF8
+        # 设置渲染服务器
+        $content = $content -replace 'pub const DEFAULT_RENDEZVOUS_SERVERS: &\[&str;.*?] = .*;', "pub const DEFAULT_RENDEZVOUS_SERVERS: &[&str; 1] = [`"$env:RENDEZVOUS_SERVER`"];"
+        # 设置公钥
+        $content = $content -replace 'pub const RS_PUB_KEY: &str = .*;', "pub const RS_PUB_KEY: &str = `"$env:RS_PUB_KEY`";"
+        $content | Set-Content -Path $configFile -Encoding UTF8
+        
+        # 修改应用名称
+        $configFile = "rustdesk\build\installer\wix\config.json"
+        $content = Get-Content -Path $configFile -Encoding UTF8 | ConvertFrom-Json
+        $config.app_title = "$env:APP_NAME"
+        $config | ConvertTo-Json | Set-Content -Path $configFile -Encoding UTF8
+        
+    - name: Build RustDesk
+      run: |
+        cargo build --release -p rustdesk --bin rustdesk
+        
+    - name: Create installer
+      run: |
+        cd target\release\installer
+        .\wix\build.bat
+        Rename-Item -Path .\msi\rustdesk.msi -NewName "$env:APP_NAME.msi"
+        
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: Windows-client
+        path: |
+          target\release\installer\msi\${{ env.APP_NAME }}.msi
+          target\release\rustdesk.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+        targets: aarch64-apple-darwin
+        
+    - name: Install dependencies
+      run: |
+        brew update
+        brew install cmake pkg-config libvpx libyuv opus libsodium nasm create-dmg
+        brew install llvm
+        echo "PATH=/opt/homebrew/opt/llvm/bin:$PATH" >> $GITHUB_ENV
+        
+    - name: Configure custom parameters
+      run: |
+        # 修改配置文件
+        # 设置渲染服务器
+        sed -i '' "s|pub const DEFAULT_RENDEZVOUS_SERVERS: &\[&str; .*\] = .*;|pub const DEFAULT_RENDEZVOUS_SERVERS: \&\\[&\str; 1] = [\"$RENDEZVOUS_SERVER\"];|g" rustdesk/src/constants.rs
+        # 设置公钥
+        sed -i '' "s|pub const RS_PUB_KEY: &str = \".*\";|pub const RS_PUB_KEY: &str = \"$RS_PUB_KEY\";|g" rustdesk/src/constants.rs
+        
+        # 修改应用名称
+        sed -i '' "s|RustDesk|$APP_NAME|g" build/mac/Info.plist
+        sed -i '' "s|com.carriez.rustdesk|com.yourdomain.$APP_NAME|g" build/mac/Info.plist
+        
+    - name: Build RustDesk
+      run: |
+        cargo build --release --target aarch64-apple-darwin
+        
+    - name: Create app bundle
+      run: |
+        bash ./build/mac/app.sh
+        mv "rustdesk.dmg" "$APP_NAME.dmg"
+        mv "target/aarch64-apple-darwin/release/RustDesk.app" "target/aarch64-apple-darwin/release/$APP_NAME.app"
+        
+    - name: Create DMG
+      run: |
+        bash ./build/mac/dmg.sh
+        
+    - name: Set file permissions
+      run: |
+        sudo xattr -cr "target/aarch64-apple-darwin/release/$APP_NAME.app"
+        sudo xattr -cr "$APP_NAME.dmg"
+        
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: macOS-client
+        path: |
+          ${{ env.APP_NAME }}.dmg
+          target/aarch64-apple-darwin/release/${{ env.APP_NAME }}.app
